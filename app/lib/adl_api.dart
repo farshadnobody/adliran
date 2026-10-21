@@ -200,10 +200,14 @@ class AdlApi {
           referer: '$login/');
       if (r.statusCode != 200) throw SiteUnavailable('HTTP ${r.statusCode}');
       d = Json.from(jsonDecode(r.data ?? ''));
+    } on SiteUnavailable {
+      rethrow;
     } on DioException catch (e) {
-      throw SiteUnavailable(e.message ?? '$e');
+      throw SiteUnavailable('${e.type.name}: ${e.error ?? e.message ?? e}');
     } on FormatException catch (e) {
-      throw SiteUnavailable(e.message);
+      throw SiteUnavailable('پاسخ غیر JSON: ${e.message}');
+    } catch (e) {
+      throw SiteUnavailable('$e');
     }
     final tok = d['token'];
     if (d['errorCode'] != 200 || tok == null || tok == '') {
@@ -270,6 +274,7 @@ class AdlApi {
   }
 
   Future<String> _step1Any(String nc, String pw) async {
+    final errs = <String>[];
     for (final h in hostSets) {
       try {
         final tok = await _step1(h[0], h[1] + h[2], nc, pw);
@@ -277,11 +282,12 @@ class AdlApi {
         _app = h[1];
         _ret = h[1] + h[2];
         return tok;
-      } on SiteUnavailable {
+      } on SiteUnavailable catch (e) {
+        errs.add('${h[0]} ← ${e.message}');
         continue; // مجموعه‌ی بعدی
       }
     }
-    throw SiteUnavailable('هیچ‌کدام از سرورها جواب ندادند');
+    throw SiteUnavailable('هیچ‌کدام از سرورها جواب ندادند\n${errs.join('\n')}');
   }
 
   /// ارسال پیامک `5#کدملی#کد` به 500049 در پس‌زمینه (فقط اندروید)
