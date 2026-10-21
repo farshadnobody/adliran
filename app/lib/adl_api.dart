@@ -42,10 +42,6 @@ class AdlApi {
   /// درخواست‌ها از طریق adl_proxy.py که روی همین کامپیوتر اجرا می‌شود رد می‌شوند.
   static const proxy = 'http://localhost:8787';
 
-  /// true: گواهی نامعتبر را فقط برای *.adliran.ir می‌پذیرد (ریسک: حمله‌ی مرد میانی روی شبکه‌ی ناامن).
-  /// بعد از نصب گواهی درست یا حل مشکل شبکه، آن را false کنید.
-  static const allowUntrustedAdlCerts = true;
-
   static const system = 'ENoticeServices';
   static const smsNumber = '500049';
 
@@ -105,15 +101,16 @@ class AdlApi {
       ));
     } else {
       _dio.interceptors.add(CookieManager(CookieJar()));
-      if (allowUntrustedAdlCerts) {
-        // گوشی زنجیره‌ی گواهی سایت‌های عدل‌ایران را نمی‌شناسد (CERTIFICATE_VERIFY_FAILED).
-        // فقط برای همین دامنه‌ها خطای گواهی نادیده گرفته می‌شود؛ بقیه‌ی سایت‌ها سخت‌گیرانه می‌مانند.
-        (_dio.httpClientAdapter as IOHttpClientAdapter).createHttpClient = () {
+      // گواهی سرورهای عدل‌ایران توسط اندروید معتبر شناخته نمی‌شود؛
+      // فقط برای دامنه‌ی adliran.ir خطای گواهی نادیده گرفته می‌شود.
+      _dio.httpClientAdapter = IOHttpClientAdapter(
+        createHttpClient: () {
           final c = HttpClient();
-          c.badCertificateCallback = (cert, host, port) => host.endsWith('.adliran.ir');
+          c.badCertificateCallback = (X509Certificate cert, String host, int port) =>
+              host == 'adliran.ir' || host.endsWith('.adliran.ir');
           return c;
-        };
-      }
+        },
+      );
     }
   }
 
@@ -127,6 +124,63 @@ class AdlApi {
   }
 
   // ---------- ابزارهای HTTP ----------
+
+  /// معادل json.dumps پایتون: جداکننده‌ی «, » و «: » و (در صورت ascii) escape به \\uXXXX
+  static String _pyJson(Object? v, {required bool ascii}) {
+    final sb = StringBuffer();
+    void str(String t) {
+      sb.write('"');
+      for (final u in t.codeUnits) {
+        if (u == 0x22) {
+          sb.write('\\"');
+        } else if (u == 0x5C) {
+          sb.write('\\\\');
+        } else if (u == 0x0A) {
+          sb.write('\\n');
+        } else if (u == 0x0D) {
+          sb.write('\\r');
+        } else if (u == 0x09) {
+          sb.write('\\t');
+        } else if (u < 0x20 || (ascii && u > 0x7F)) {
+          sb.write('\\u${u.toRadixString(16).padLeft(4, '0')}');
+        } else {
+          sb.writeCharCode(u);
+        }
+      }
+      sb.write('"');
+    }
+
+    void w(Object? x) {
+      if (x is Map) {
+        sb.write('{');
+        var first = true;
+        x.forEach((k, val) {
+          if (!first) sb.write(', ');
+          first = false;
+          str('$k');
+          sb.write(': ');
+          w(val);
+        });
+        sb.write('}');
+      } else if (x is List) {
+        sb.write('[');
+        for (var i = 0; i < x.length; i++) {
+          if (i > 0) sb.write(', ');
+          w(x[i]);
+        }
+        sb.write(']');
+      } else if (x is String) {
+        str(x);
+      } else if (x == null) {
+        sb.write('null');
+      } else {
+        sb.write('$x');
+      }
+    }
+
+    w(v);
+    return sb.toString();
+  }
   String _origin(String u) {
     final p = u.split('/');
     return '${p[0]}//${p[2]}';
@@ -134,7 +188,7 @@ class AdlApi {
 
   Future<Response<String>> _postJson(String url, Object body, {String? referer}) =>
       _dio.post<String>(url,
-          data: jsonEncode(body),
+          data: _pyJson(body, ascii: true),
           options: Options(
             contentType: 'application/json;charset=UTF-8',
             responseType: ResponseType.plain,
@@ -210,29 +264,25 @@ class AdlApi {
     try {
       final r = await _postJson(
           '$login/Login/CheckPersonLogin',
-          {'requestMessage': jsonEncode(msg), 'captchaValue': '', 'captchaId': ''},
+          {'requestMessage': _pyJson(msg, ascii: false), 'captchaValue': '', 'captchaId': ''},
           referer: '$login/');
-      if (r.statusCode != 200) throw SiteUnavailable('HTTP ${r.statusCode}');
+      if (r.statusCode != 200) {
+        var body = (r.data ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+        if (body.length > 300) body = body.substring(0, 300);
+        throw SiteUnavailable('HTTP ${r.statusCode} $body');
+      }
       d = Json.from(jsonDecode(r.data ?? ''));
-    } on SiteUnavailable {
-      rethrow;
     } on DioException catch (e) {
-      throw SiteUnavailable('${e.type.name}: ${e.error ?? e.message ?? e}');
+      throw SiteUnavailable(e.message ?? '$e');
     } on FormatException catch (e) {
-      throw SiteUnavailable('پاسخ غیر JSON: ${e.message}');
-    } catch (e) {
-      throw SiteUnavailable('$e');
+      throw SiteUnavailable(e.message);
     }
     final tok = d['token'];
     if (d['errorCode'] != 200 || tok == null || tok == '') {
       throw LoginRejected('${d['message'] ?? 'ورود رد شد'}');
     }
-    // پیام سرور درباره‌ی رمز موقت (مثلاً «قبلاً ارسال شده» + راهنمای تعیین رمز دلخواه با پیامک)
-    _step1Msg = '${d['result'] ?? ''}'.replaceAll(RegExp(r'<br\s*/?>'), '\n').trim();
     return tok as String;
   }
-
-  String _step1Msg = '';
 
   Future<(String, String)> _step2(String nc, String pw, String otp, String token) async {
     final msg = {
@@ -244,7 +294,7 @@ class AdlApi {
       'OtpType': otpType,
     };
     final r = await _postJson('$_login/Login/CheckPersonOtpLogin',
-        {'requestMessage': jsonEncode(msg), 'token': token},
+        {'requestMessage': _pyJson(msg, ascii: false), 'token': token},
         referer: '$_login/');
     Json d;
     try {
@@ -267,6 +317,7 @@ class AdlApi {
           responseType: ResponseType.plain,
           headers: {
             'Accept': 'text/html,application/xhtml+xml,*/*',
+            'X-Requested-With': 'XMLHttpRequest',
             'Origin': _login,
             'Referer': '$_login/',
           },
@@ -292,7 +343,6 @@ class AdlApi {
   }
 
   Future<String> _step1Any(String nc, String pw) async {
-    final errs = <String>[];
     for (final h in hostSets) {
       try {
         final tok = await _step1(h[0], h[1] + h[2], nc, pw);
@@ -300,12 +350,11 @@ class AdlApi {
         _app = h[1];
         _ret = h[1] + h[2];
         return tok;
-      } on SiteUnavailable catch (e) {
-        errs.add('${h[0]} ← ${e.message}');
+      } on SiteUnavailable {
         continue; // مجموعه‌ی بعدی
       }
     }
-    throw SiteUnavailable('هیچ‌کدام از سرورها جواب ندادند\n${errs.join('\n')}');
+    throw SiteUnavailable('هیچ‌کدام از سرورها جواب ندادند');
   }
 
   /// ارسال پیامک `5#کدملی#کد` به 500049 در پس‌زمینه (فقط اندروید)
@@ -329,11 +378,9 @@ class AdlApi {
       _reset();
       if (kIsWeb) await _resetProxy();
       _pendingToken = await _step1Any(nc, pw);
-      throw NeedSmsCode(_step1Msg.isNotEmpty
-          ? _step1Msg
-          : (code == null
-              ? 'پیامک حاوی کد به گوشی شما ارسال شد؛ کد را وارد کنید'
-              : 'پیامک جدید ارسال شد؛ کد جدید را وارد کنید'));
+      throw NeedSmsCode(code == null
+          ? 'پیامک حاوی کد به گوشی شما ارسال شد؛ کد را وارد کنید'
+          : 'پیامک جدید ارسال شد؛ کد جدید را وارد کنید');
     }
     try {
       final r = await _step2(nc, pw, code, _pendingToken!);
@@ -351,7 +398,7 @@ class AdlApi {
     if (nationalCode != null) await Store.saveCreds(nationalCode, password ?? '');
     final c = await Store.creds();
     if (c == null) throw LoginRejected('ابتدا وارد شوید');
-    final nc = c['nc']!, pw = c['pw']!;
+    final nc = c['nc']!.trim(), pw = c['pw']!.trim();
     _ready = false;
     if (Store.manual) return _signInManual(nc, pw, manualCode);
     for (var attempt = 0; attempt < 4; attempt++) {
