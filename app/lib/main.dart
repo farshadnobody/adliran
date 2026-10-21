@@ -1,4 +1,6 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'adl_api.dart';
 import 'home.dart';
 import 'store.dart';
@@ -7,7 +9,8 @@ final api = AdlApi();
 
 void main() => runApp(const App());
 
-String errText(Object e) => e is LoginRejected || e is SiteUnavailable ? '$e' : 'خطا: $e';
+String errText(Object e) =>
+    e is LoginRejected || e is SiteUnavailable || e is NeedSmsCode ? '$e' : 'خطا: $e';
 
 class App extends StatelessWidget {
   const App({super.key});
@@ -20,6 +23,8 @@ class App extends StatelessWidget {
       );
 }
 
+enum _S { loading, login, code, home }
+
 /// اگر اعتبارنامه ذخیره باشد خودکار وارد می‌شود، وگرنه صفحه‌ی لاگین
 class Gate extends StatefulWidget {
   const Gate({super.key});
@@ -28,55 +33,75 @@ class Gate extends StatefulWidget {
 }
 
 class _GateState extends State<Gate> {
-  Widget? _page;
+  _S _s = _S.loading;
+  String? _nc, _err;
+
   @override
   void initState() {
     super.initState();
     _boot();
   }
 
-  Future<void> _boot() async {
-    await Store.loadKeys();
-    final c = await Store.creds();
-    if (c == null) return _set(const LoginPage());
-    try {
-      await api.signIn();
-      _set(HomePage(api: api, onLogout: _logout));
-    } catch (e) {
-      _set(LoginPage(initialNc: c['nc'], error: errText(e)));
+  void _go(_S s, {String? nc, String? err}) {
+    if (mounted) {
+      setState(() {
+        _s = s;
+        _nc = nc;
+        _err = err;
+      });
     }
   }
 
-  void _set(Widget w) {
-    if (mounted) setState(() => _page = w);
+  Future<void> _boot() async {
+    Map<String, String>? c;
+    try {
+      await Store.loadMode();
+      await Store.loadKeys();
+      c = await Store.creds();
+    } catch (_) {}
+    if (c == null) return _go(_S.login);
+    try {
+      await api.signIn();
+      _go(_S.home);
+    } on NeedSmsCode catch (e) {
+      _go(_S.code, nc: c['nc'], err: e.message);
+    } catch (e) {
+      _go(_S.login, nc: c['nc'], err: errText(e));
+    }
   }
 
   Future<void> _logout() async {
     await Store.clearCreds();
-    _set(const LoginPage());
+    _go(_S.login);
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_page == null) {
-      return const Scaffold(
-        body: Center(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 16),
-            Text('در حال ورود...'),
-          ]),
-        ),
-      );
+    switch (_s) {
+      case _S.loading:
+        return const Scaffold(
+          body: Center(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('در حال ورود...'),
+            ]),
+          ),
+        );
+      case _S.login:
+        return LoginPage(initialNc: _nc, error: _err, onDone: () => _go(_S.home));
+      case _S.code:
+        return CodePage(nc: _nc ?? '', message: _err, onDone: () => _go(_S.home), onCancel: _logout);
+      case _S.home:
+        return HomePage(api: api, onLogout: _logout);
     }
-    return _page is LoginPage ? LoginPage(initialNc: (_page as LoginPage).initialNc, error: (_page as LoginPage).error, onDone: () => _set(HomePage(api: api, onLogout: _logout))) : _page!;
   }
 }
 
 class LoginPage extends StatefulWidget {
   final String? initialNc, error;
-  final VoidCallback? onDone;
-  const LoginPage({super.key, this.initialNc, this.error, this.onDone});
+  final VoidCallback onDone;
+  const LoginPage({super.key, this.initialNc, this.error, required this.onDone});
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
@@ -85,6 +110,7 @@ class _LoginPageState extends State<LoginPage> {
   late final _nc = TextEditingController(text: widget.initialNc);
   final _pw = TextEditingController();
   bool _busy = false;
+  late bool _manual = Store.manual;
   String? _err;
 
   @override
@@ -105,7 +131,24 @@ class _LoginPageState extends State<LoginPage> {
     });
     try {
       await api.signIn(nationalCode: nc, password: pw);
-      widget.onDone?.call();
+      widget.onDone();
+    } on NeedSmsCode catch (e) {
+      if (mounted) {
+        await Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (ctx) => CodePage(
+              nc: nc,
+              message: e.message,
+              onDone: () {
+                Navigator.pop(ctx);
+                widget.onDone();
+              },
+              onCancel: () => Navigator.pop(ctx),
+            ),
+          ),
+        );
+      }
     } catch (e) {
       if (mounted) setState(() => _err = errText(e));
     } finally {
@@ -122,6 +165,27 @@ class _LoginPageState extends State<LoginPage> {
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 400),
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  if (!kIsWeb) ...[
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(value: false, icon: Icon(Icons.bolt), label: Text('خودکار')),
+                      ButtonSegment(value: true, icon: Icon(Icons.edit), label: Text('دستی')),
+                    ],
+                    selected: {_manual},
+                    onSelectionChanged: _busy
+                        ? null
+                        : (v) async {
+                            await Store.setManual(v.first);
+                            setState(() => _manual = v.first);
+                          },
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    _manual ? 'پیامک را خودتان می‌فرستید و کد را وارد می‌کنید' : 'پیامک توسط خود اپ ارسال می‌شود',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  ],
+                  const SizedBox(height: 24),
                   const Icon(Icons.gavel, size: 64),
                   const SizedBox(height: 8),
                   Text('ابلاغیه‌های قضایی', style: Theme.of(context).textTheme.headlineSmall),
@@ -150,7 +214,7 @@ class _LoginPageState extends State<LoginPage> {
                     child: FilledButton(
                       onPressed: _busy ? null : _submit,
                       child: _busy
-                          ? const Text('در حال ارسال پیامک و ورود (تا ۴۰ ثانیه)...')
+                          ? Text(_manual ? 'در حال ورود...' : 'در حال ارسال پیامک و ورود (تا ۴۰ ثانیه)...')
                           : const Text('ورود'),
                     ),
                   ),
@@ -161,4 +225,78 @@ class _LoginPageState extends State<LoginPage> {
           ),
         ),
       );
+}
+
+/// صفحه‌ی ورود کد پیامک (حالت دستی)
+class CodePage extends StatefulWidget {
+  final String nc;
+  final String? message;
+  final VoidCallback onDone, onCancel;
+  const CodePage({super.key, required this.nc, this.message, required this.onDone, required this.onCancel});
+  @override
+  State<CodePage> createState() => _CodePageState();
+}
+
+class _CodePageState extends State<CodePage> {
+  final _code = TextEditingController();
+  bool _busy = false;
+  late String? _err = widget.message;
+
+  Future<void> _submit() async {
+    final code = _code.text.trim();
+    if (code.isEmpty) {
+      setState(() => _err = 'کد را وارد کنید');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _err = null;
+    });
+    try {
+      await api.signIn(manualCode: code);
+      widget.onDone();
+    } catch (e) {
+      if (mounted) setState(() => _err = errText(e));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('کد پیامک'),
+        leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: widget.onCancel),
+      ),
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 400),
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                const Text('کدی را که عدل‌ایران به گوشی شما پیامک کرده اینجا وارد کنید:'),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _code,
+                  keyboardType: TextInputType.number,
+                  onSubmitted: (_) => _submit(),
+                  decoration: const InputDecoration(labelText: 'کد پیامک', border: OutlineInputBorder()),
+                ),
+                const SizedBox(height: 16),
+                if (_err != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Text(_err!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                  ),
+                FilledButton(onPressed: _busy ? null : _submit, child: Text(_busy ? 'در حال ورود...' : 'ورود')),
+                if (_busy) const Padding(padding: EdgeInsets.only(top: 16), child: LinearProgressIndicator()),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }

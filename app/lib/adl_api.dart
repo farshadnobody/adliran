@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 import 'package:cookie_jar/cookie_jar.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'jalali.dart';
@@ -25,9 +26,21 @@ class SiteUnavailable implements Exception {
 
 class SessionExpired implements Exception {}
 
+/// در حالت دستی: کد پیامک لازم است (ندارد، منقضی یا اشتباه است)
+class NeedSmsCode implements Exception {
+  final String message;
+  NeedSmsCode([this.message = 'کد پیامک لازم است']);
+  @override
+  String toString() => message;
+}
+
 typedef Json = Map<String, dynamic>;
 
 class AdlApi {
+  /// روی وب (Chrome) مرورگر اجازه‌ی ارتباط مستقیم با سایت عدل‌ایران را نمی‌دهد (CORS/کوکی)؛
+  /// درخواست‌ها از طریق adl_proxy.py که روی همین کامپیوتر اجرا می‌شود رد می‌شوند.
+  static const proxy = 'http://localhost:8787';
+
   static const system = 'ENoticeServices';
   static const smsNumber = '500049';
 
@@ -57,12 +70,46 @@ class AdlApi {
       followRedirects: false,
       validateStatus: (s) => s != null && s < 500,
       headers: {
-        'User-Agent': _ua,
+        if (!kIsWeb) 'User-Agent': _ua,
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
       },
-    ))
-      ..interceptors.add(CookieManager(CookieJar()));
+    ));
+    if (kIsWeb) {
+      _dio.interceptors.add(InterceptorsWrapper(
+        onRequest: (o, h) {
+          final target = o.uri.toString();
+          final origin = o.headers.remove('Origin');
+          final referer = o.headers.remove('Referer');
+          o.headers.remove('User-Agent');
+          if (origin != null) o.headers['X-Fwd-Origin'] = origin;
+          if (referer != null) o.headers['X-Fwd-Referer'] = referer;
+          o.baseUrl = '';
+          o.path = '$proxy/proxy';
+          o.queryParameters = {'url': target};
+          h.next(o);
+        },
+        onResponse: (r, h) {
+          // پراکسی ریدایرکت‌ها را به 200 تبدیل می‌کند تا مرورگر خودش دنبالشان نرود
+          final real = int.tryParse(r.headers.value('x-real-status') ?? '');
+          if (real != null) r.statusCode = real;
+          final loc = r.headers.value('x-real-location');
+          if (loc != null) r.headers.set('location', loc);
+          h.next(r);
+        },
+      ));
+    } else {
+      _dio.interceptors.add(CookieManager(CookieJar()));
+    }
+  }
+
+  /// نشست (کوکی‌های) پراکسی را پاک می‌کند — فقط وب
+  Future<void> _resetProxy() async {
+    try {
+      await Dio().get('$proxy/reset');
+    } on DioException {
+      throw SiteUnavailable('پراکسی در دسترس نیست؛ adl_proxy.py را اجرا کنید');
+    }
   }
 
   // ---------- ابزارهای HTTP ----------
@@ -209,7 +256,9 @@ class AdlApi {
       r = await _dio.get<String>(next, options: Options(responseType: ResponseType.plain));
     }
     final t = await _dio.get<String>('$_app/Notice/Home/GetNewEnoticeCount',
-        options: Options(responseType: ResponseType.plain, headers: {'Referer': ret}));
+        options: Options(
+            responseType: ResponseType.plain,
+            headers: {'Referer': ret, 'X-Requested-With': 'XMLHttpRequest'}));
     if (t.statusCode == 200) {
       try {
         final j = jsonDecode(t.data ?? '');
@@ -248,18 +297,43 @@ class AdlApi {
     return code;
   }
 
-  /// ورود کامل. اگر کد پیامک نداریم/منقضی شده، پیامک جدید می‌فرستد.
-  Future<void> signIn({String? nationalCode, String? password}) async {
+  String? _pendingToken;
+
+  /// دقیقاً مثل اسکریپت پایتون: مرحله ۱ (سرور پیامک می‌فرستد) ← کاربر کد را وارد می‌کند ← مراحل ۲ و ۳
+  Future<void> _signInManual(String nc, String pw, String? code) async {
+    if (code == null || _pendingToken == null) {
+      _reset();
+      if (kIsWeb) await _resetProxy();
+      _pendingToken = await _step1Any(nc, pw);
+      throw NeedSmsCode(code == null
+          ? 'پیامک حاوی کد به گوشی شما ارسال شد؛ کد را وارد کنید'
+          : 'پیامک جدید ارسال شد؛ کد جدید را وارد کنید');
+    }
+    try {
+      final r = await _step2(nc, pw, code, _pendingToken!);
+      await _step3(r.$1, r.$2);
+      _pendingToken = null;
+      _ready = true;
+    } on LoginRejected catch (e) {
+      throw NeedSmsCode('کد رد شد (${e.message})');
+    }
+  }
+
+  /// ورود کامل. حالت خودکار: اگر کد پیامک نداریم/منقضی شده، پیامک جدید می‌فرستد.
+  /// حالت دستی: پیامک نمی‌فرستد؛ اگر کد لازم باشد NeedSmsCode پرتاب می‌شود.
+  Future<void> signIn({String? nationalCode, String? password, String? manualCode}) async {
     if (nationalCode != null) await Store.saveCreds(nationalCode, password ?? '');
     final c = await Store.creds();
     if (c == null) throw LoginRejected('ابتدا وارد شوید');
     final nc = c['nc']!, pw = c['pw']!;
     _ready = false;
+    if (Store.manual) return _signInManual(nc, pw, manualCode);
     for (var attempt = 0; attempt < 4; attempt++) {
       _reset();
       final token = await _step1Any(nc, pw);
       var code = await Store.smsCode();
       if (code == null) {
+        if (Store.manual) throw NeedSmsCode();
         code = await _sendSms(nc);
         await Future.delayed(const Duration(seconds: 10)); // فرصت پردازش پیامک
       }
@@ -268,7 +342,11 @@ class AdlApi {
         await _step3(r.$1, r.$2);
         _ready = true;
         return;
-      } on LoginRejected {
+      } on LoginRejected catch (e) {
+        if (Store.manual) {
+          await Store.clearSms();
+          throw NeedSmsCode('کد اشتباه یا منقضی است (${e.message})');
+        }
         if (attempt == 3) rethrow;
         final age = await Store.smsAgeSeconds();
         if (age == null || age > 180) {
@@ -431,7 +509,7 @@ class AdlApi {
   }
 
   /// مشاهده + دانلود ابلاغیه و پیوست‌ها + ذخیره در حافظه‌ی گوشی
-  Future<Directory> downloadAndSave(Json n, void Function(String) status) => run(() async {
+  Future<Directory?> downloadAndSave(Json n, void Function(String) status) => run(() async {
         status('ثبت مشاهده...');
         try {
           n = {...n, ...await _viewNotice(n)};
@@ -452,6 +530,10 @@ class AdlApi {
             rethrow;
           } catch (_) {}
           await Future.delayed(const Duration(milliseconds: 500));
+        }
+        if (kIsWeb) {
+          await Store.saveWebNotice(n, pdf, files);
+          return null;
         }
         return Store.saveNotice(n, pdf, files);
       });

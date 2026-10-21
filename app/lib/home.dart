@@ -1,9 +1,11 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
 import 'adl_api.dart';
 import 'jalali.dart';
 import 'store.dart';
+import 'web_open.dart';
 
 class HomePage extends StatelessWidget {
   final AdlApi api;
@@ -27,7 +29,8 @@ class HomePage extends StatelessWidget {
 // ---------- باز کردن ابلاغیه ----------
 Future<void> openNotice(BuildContext context, AdlApi api, Map<String, dynamic> n) async {
   var dir = await Store.savedDir(n);
-  if (dir == null) {
+  final alreadySaved = kIsWeb ? Store.savedKeys.contains(Store.key(n)) : dir != null;
+  if (!alreadySaved) {
     if (!context.mounted) return;
     if ('${n['FirrstViewDateTime'] ?? ''}'.isEmpty) {
       final ok = await showDialog<bool>(
@@ -71,7 +74,24 @@ Future<void> openNotice(BuildContext context, AdlApi api, Map<String, dynamic> n
     if (context.mounted) Navigator.pop(context);
   }
   if (!context.mounted) return;
-  final files = Store.files(dir);
+  if (kIsWeb) {
+    final wf = Store.webFiles(n) ?? {};
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => SafeArea(
+        child: ListView(shrinkWrap: true, children: [
+          for (final e in wf.entries)
+            ListTile(
+              leading: const Icon(Icons.attach_file),
+              title: Text(e.key == 'abelaghie.pdf' ? 'متن ابلاغیه' : e.key),
+              onTap: () => openBytesWeb(e.key, e.value),
+            ),
+        ]),
+      ),
+    );
+    return;
+  }
+  final files = Store.files(dir!);
   if (files.length == 1) {
     await OpenFilex.open(files.first.path);
     return;

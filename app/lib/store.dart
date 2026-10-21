@@ -9,6 +9,14 @@ class Store {
   static final changes = ValueNotifier<int>(0);
   static Set<String> savedKeys = {};
 
+  /// حالت ورود: false = خودکار (اپ پیامک می‌فرستد)، true = دستی (کاربر کد را وارد می‌کند)
+  static bool manual = false;
+  static Future<void> loadMode() async => manual = kIsWeb || await _s.read(key: 'manual') == '1';
+  static Future<void> setManual(bool v) async {
+    manual = v;
+    await _s.write(key: 'manual', value: v ? '1' : '0');
+  }
+
   // ---------- اعتبارنامه و کد پیامک ----------
   static Future<void> saveCreds(String nc, String pw) async {
     await _s.write(key: 'nc', value: nc);
@@ -64,7 +72,22 @@ class Store {
 
   static String key(Map n) => safe('${n['NoticedDocNo'] ?? n['ObjectId'] ?? ''}');
 
+  // ---- فقط وب (Chrome): فایل‌ها در حافظه‌ی صفحه نگه داشته می‌شوند (با رفرش پاک می‌شوند) ----
+  static final Map<String, Map<String, dynamic>> _webInfo = {};
+  static final Map<String, Map<String, List<int>>> _webFiles = {};
+
+  static Future<void> saveWebNotice(Map n, List<int> pdf, Map<String, List<int>> files) async {
+    final k = key(n);
+    _webInfo[k] = {...Map<String, dynamic>.from(n), 'savedAt': DateTime.now().toIso8601String()};
+    _webFiles[k] = {'abelaghie.pdf': pdf, ...files};
+    savedKeys.add(k);
+    changes.value++;
+  }
+
+  static Map<String, List<int>>? webFiles(Map n) => _webFiles[key(n)];
+
   static Future<void> loadKeys() async {
+    if (kIsWeb) return;
     final r = await _root();
     savedKeys = {
       for (final e in r.listSync())
@@ -73,6 +96,7 @@ class Store {
   }
 
   static Future<Directory?> savedDir(Map n) async {
+    if (kIsWeb) return null;
     final d = Directory('${(await _root()).path}/${key(n)}');
     return File('${d.path}/abelaghie.pdf').existsSync() ? d : null;
   }
@@ -93,7 +117,7 @@ class Store {
 
   static Future<List<Map<String, dynamic>>> savedList() async {
     final out = <Map<String, dynamic>>[];
-    for (final e in (await _root()).listSync()) {
+    for (final e in kIsWeb ? <FileSystemEntity>[] : (await _root()).listSync()) {
       final f = File('${e.path}/info.json');
       if (e is Directory && f.existsSync()) {
         try {
@@ -101,6 +125,7 @@ class Store {
         } catch (_) {}
       }
     }
+    if (kIsWeb) out.addAll(_webInfo.values);
     out.sort((a, b) => '${b['WebDateTime'] ?? ''}'.compareTo('${a['WebDateTime'] ?? ''}'));
     return out;
   }
@@ -112,6 +137,8 @@ class Store {
   static Future<void> delete(Map n) async {
     final d = await savedDir(n);
     if (d != null) await d.delete(recursive: true);
+    _webInfo.remove(key(n));
+    _webFiles.remove(key(n));
     savedKeys.remove(key(n));
     changes.value++;
   }
