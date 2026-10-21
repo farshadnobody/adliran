@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 import 'package:cookie_jar/cookie_jar.dart';
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
@@ -40,6 +41,10 @@ class AdlApi {
   /// روی وب (Chrome) مرورگر اجازه‌ی ارتباط مستقیم با سایت عدل‌ایران را نمی‌دهد (CORS/کوکی)؛
   /// درخواست‌ها از طریق adl_proxy.py که روی همین کامپیوتر اجرا می‌شود رد می‌شوند.
   static const proxy = 'http://localhost:8787';
+
+  /// true: گواهی نامعتبر را فقط برای *.adliran.ir می‌پذیرد (ریسک: حمله‌ی مرد میانی روی شبکه‌ی ناامن).
+  /// بعد از نصب گواهی درست یا حل مشکل شبکه، آن را false کنید.
+  static const allowUntrustedAdlCerts = true;
 
   static const system = 'ENoticeServices';
   static const smsNumber = '500049';
@@ -100,6 +105,15 @@ class AdlApi {
       ));
     } else {
       _dio.interceptors.add(CookieManager(CookieJar()));
+      if (allowUntrustedAdlCerts) {
+        // گوشی زنجیره‌ی گواهی سایت‌های عدل‌ایران را نمی‌شناسد (CERTIFICATE_VERIFY_FAILED).
+        // فقط برای همین دامنه‌ها خطای گواهی نادیده گرفته می‌شود؛ بقیه‌ی سایت‌ها سخت‌گیرانه می‌مانند.
+        (_dio.httpClientAdapter as IOHttpClientAdapter).createHttpClient = () {
+          final c = HttpClient();
+          c.badCertificateCallback = (cert, host, port) => host.endsWith('.adliran.ir');
+          return c;
+        };
+      }
     }
   }
 
@@ -213,8 +227,12 @@ class AdlApi {
     if (d['errorCode'] != 200 || tok == null || tok == '') {
       throw LoginRejected('${d['message'] ?? 'ورود رد شد'}');
     }
+    // پیام سرور درباره‌ی رمز موقت (مثلاً «قبلاً ارسال شده» + راهنمای تعیین رمز دلخواه با پیامک)
+    _step1Msg = '${d['result'] ?? ''}'.replaceAll(RegExp(r'<br\s*/?>'), '\n').trim();
     return tok as String;
   }
+
+  String _step1Msg = '';
 
   Future<(String, String)> _step2(String nc, String pw, String otp, String token) async {
     final msg = {
@@ -311,9 +329,11 @@ class AdlApi {
       _reset();
       if (kIsWeb) await _resetProxy();
       _pendingToken = await _step1Any(nc, pw);
-      throw NeedSmsCode(code == null
-          ? 'پیامک حاوی کد به گوشی شما ارسال شد؛ کد را وارد کنید'
-          : 'پیامک جدید ارسال شد؛ کد جدید را وارد کنید');
+      throw NeedSmsCode(_step1Msg.isNotEmpty
+          ? _step1Msg
+          : (code == null
+              ? 'پیامک حاوی کد به گوشی شما ارسال شد؛ کد را وارد کنید'
+              : 'پیامک جدید ارسال شد؛ کد جدید را وارد کنید'));
     }
     try {
       final r = await _step2(nc, pw, code, _pendingToken!);
