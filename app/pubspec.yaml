@@ -1,0 +1,21 @@
+name: adl_notices_app
+description: ابلاغیه‌های قضایی — ورود با کد ملی و پیامک، مشاهده و ذخیره آفلاین
+publish_to: none
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.2.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio: ^5.4.3
+  dio_cookie_manager: ^3.1.1
+  cookie_jar: ^4.0.8
+  flutter_secure_storage: ^9.2.2
+  path_provider: ^2.1.3
+  open_filex: ^4.4.0
+  another_telephony: ^0.4.1
+
+flutter:
+  uses-material-design: true
