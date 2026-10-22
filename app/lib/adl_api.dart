@@ -8,6 +8,7 @@ import 'package:dio/io.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
+import 'app_log.dart';
 import 'jalali.dart';
 import 'store.dart';
 
@@ -16,6 +17,11 @@ class LoginRejected implements Exception {
   LoginRejected(this.message);
   @override
   String toString() => message;
+}
+
+/// کد ملی یا رمز عبور اشتباه است (پاسخ صریح سرور در مرحله‌ی ۱)
+class WrongCredentials extends LoginRejected {
+  WrongCredentials(super.message);
 }
 
 class SiteUnavailable implements Exception {
@@ -112,6 +118,63 @@ class AdlApi {
         },
       );
     }
+    // ثبت پاسخ‌های غیرعادی سرور در لاگ (بدنه‌ی درخواست‌ها هرگز ثبت نمی‌شود)
+    _dio.interceptors.add(InterceptorsWrapper(
+      onResponse: (r, h) {
+        _logResponse(r);
+        h.next(r);
+      },
+      onError: (e, h) {
+        if (e.requestOptions.extra['quiet'] != true || e.response == null) {
+          final r = e.response;
+          AppLog.add(
+            'error',
+            _tag(e.requestOptions),
+            r != null ? 'HTTP ${r.statusCode}' : '${e.type.name}: ${e.error ?? e.message}',
+            detail: r != null ? _snip(r.data) : null,
+          );
+        }
+        h.next(e);
+      },
+    ));
+  }
+
+  static String _tag(RequestOptions o) {
+    final target = '${o.queryParameters['url'] ?? o.uri}';
+    final u = Uri.tryParse(target);
+    return '${o.method} ${u == null ? target : '${u.host}${u.path}'}';
+  }
+
+  /// خلاصه‌ی بدنه‌ی پاسخ (بدون تگ HTML و فایل باینری)
+  static String? _snip(Object? data, {int max = 600}) {
+    if (data == null) return null;
+    String t;
+    if (data is List<int>) {
+      if (data.length > 4 && data[0] == 0x25 && data[1] == 0x50) return '[PDF ${data.length} bytes]';
+      t = utf8.decode(data, allowMalformed: true);
+    } else {
+      t = '$data';
+    }
+    t = t
+        .replaceAll(RegExp(r'<script[\s\S]*?</script>|<style[\s\S]*?</style>', caseSensitive: false), ' ')
+        .replaceAll(RegExp(r'<[^>]+>'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (t.isEmpty) return '[بدنه‌ی خالی]';
+    return t.length > max ? '${t.substring(0, max)}…' : t;
+  }
+
+  void _logResponse(Response r) {
+    if (r.requestOptions.extra['quiet'] == true) return;
+    final code = r.statusCode ?? 0;
+    if (code >= 200 && code < 300) return;
+    final loc = r.headers.value('location');
+    AppLog.add(
+      code >= 400 ? 'error' : 'warn',
+      _tag(r.requestOptions),
+      'HTTP $code${loc != null ? '  →  $loc' : ''}${code == 302 ? '  (احتمالاً نشست منقضی)' : ''}',
+      detail: _snip(r.data),
+    );
   }
 
   /// نشست (کوکی‌های) پراکسی را پاک می‌کند — فقط وب
@@ -186,12 +249,15 @@ class AdlApi {
     return '${p[0]}//${p[2]}';
   }
 
-  Future<Response<String>> _postJson(String url, Object body, {String? referer}) =>
+  Future<Response<String>> _postJson(String url, Object body,
+          {String? referer, bool anyStatus = false, bool quiet = false}) =>
       _dio.post<String>(url,
           data: _pyJson(body, ascii: true),
           options: Options(
             contentType: 'application/json;charset=UTF-8',
             responseType: ResponseType.plain,
+            validateStatus: anyStatus ? (_) => true : null,
+            extra: quiet ? {'quiet': true} : null,
             headers: {
               'X-Requested-With': 'XMLHttpRequest',
               'Origin': _origin(url),
@@ -267,21 +333,38 @@ class AdlApi {
           {'requestMessage': _pyJson(msg, ascii: false), 'captchaValue': '', 'captchaId': ''},
           referer: '$login/');
       if (r.statusCode != 200) {
+        // سرور خطای ورود (مثل رمز اشتباه) را با HTTP 409 و بدنه‌ی JSON برمی‌گرداند
+        Json? j;
+        try {
+          final x = jsonDecode(r.data ?? '');
+          if (x is Map) j = Json.from(x);
+        } catch (_) {}
+        if (j != null && (r.statusCode ?? 0) < 500 && '${j['message'] ?? ''}'.isNotEmpty) {
+          throw _rejection('${j['message']}');
+        }
         var body = (r.data ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
         if (body.length > 300) body = body.substring(0, 300);
         throw SiteUnavailable('HTTP ${r.statusCode} $body');
       }
       d = Json.from(jsonDecode(r.data ?? ''));
     } on DioException catch (e) {
-      throw SiteUnavailable(e.message ?? '$e');
+      throw SiteUnavailable('${e.type.name}: ${e.error ?? e.message ?? e}');
     } on FormatException catch (e) {
-      throw SiteUnavailable(e.message);
+      throw SiteUnavailable('پاسخ JSON نیست: ${e.message}');
     }
     final tok = d['token'];
     if (d['errorCode'] != 200 || tok == null || tok == '') {
-      throw LoginRejected('${d['message'] ?? 'ورود رد شد'}');
+      throw _rejection('${d['message'] ?? 'ورود رد شد'}');
     }
     return tok as String;
+  }
+
+  /// پیام سرور درباره‌ی کد ملی/رمز ← WrongCredentials، بقیه ← LoginRejected
+  static LoginRejected _rejection(String m) {
+    final wrong = m.contains('رمز') || m.contains('شماره ملی') || m.contains('نام کاربری') || m.contains('کد ملی');
+    return wrong
+        ? WrongCredentials('کد ملی یا رمز عبور اشتباه است.\nلطفاً با دقت دوباره وارد کنید.')
+        : LoginRejected(m);
   }
 
   Future<(String, String)> _step2(String nc, String pw, String otp, String token) async {
@@ -343,6 +426,7 @@ class AdlApi {
   }
 
   Future<String> _step1Any(String nc, String pw) async {
+    final errs = <String>[];
     for (final h in hostSets) {
       try {
         final tok = await _step1(h[0], h[1] + h[2], nc, pw);
@@ -350,11 +434,18 @@ class AdlApi {
         _app = h[1];
         _ret = h[1] + h[2];
         return tok;
-      } on SiteUnavailable {
-        continue; // مجموعه‌ی بعدی
+      } on SiteUnavailable catch (e) {
+        errs.add('${h[0]} ← ${e.message}');
+      } on LoginRejected {
+        rethrow;
+      } catch (e, st) {
+        // هر خطای غیرمنتظره (مثلاً خطای کد/تبدیل نوع) هم دیده شود
+        errs.add('${h[0]} ← ${e.runtimeType}: $e');
+        // ignore: avoid_print
+        print('step1 error on ${h[0]}: $e\n$st');
       }
     }
-    throw SiteUnavailable('هیچ‌کدام از سرورها جواب ندادند');
+    throw SiteUnavailable('هیچ‌کدام از سرورها جواب ندادند\n${errs.join('\n')}');
   }
 
   /// ارسال پیامک `5#کدملی#کد` به 500049 در پس‌زمینه (فقط اندروید)
@@ -395,6 +486,19 @@ class AdlApi {
   /// ورود کامل. حالت خودکار: اگر کد پیامک نداریم/منقضی شده، پیامک جدید می‌فرستد.
   /// حالت دستی: پیامک نمی‌فرستد؛ اگر کد لازم باشد NeedSmsCode پرتاب می‌شود.
   Future<void> signIn({String? nationalCode, String? password, String? manualCode}) async {
+    try {
+      await _signInCore(nationalCode: nationalCode, password: password, manualCode: manualCode);
+    } on WrongCredentials catch (e) {
+      AppLog.add('warn', 'ورود', 'کد ملی/رمز اشتباه: ${e.message}');
+      await Store.clearCreds(); // رمز غلط نباید ذخیره بماند / دوباره امتحان شود
+      rethrow;
+    } catch (e) {
+      if (e is! NeedSmsCode) AppLog.add('error', 'ورود', '${e.runtimeType}: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> _signInCore({String? nationalCode, String? password, String? manualCode}) async {
     if (nationalCode != null) await Store.saveCreds(nationalCode, password ?? '');
     final c = await Store.creds();
     if (c == null) throw LoginRejected('ابتدا وارد شوید');
@@ -433,10 +537,14 @@ class AdlApi {
 
   /// اجرای یک درخواست؛ اگر نشست پریده بود یک بار دوباره وارد می‌شود
   Future<T> run<T>(Future<T> Function() f) async {
-    if (!_ready) await signIn();
+    if (!_ready) {
+      AppLog.add('info', 'نشست', 'نشست آماده نبود؛ ورود خودکار');
+      await signIn();
+    }
     try {
       return await f();
     } on SessionExpired {
+      AppLog.add('warn', 'نشست', 'نشست منقضی شد؛ ورود دوباره و تکرار درخواست');
       await signIn();
       return await f();
     }
@@ -475,6 +583,7 @@ class AdlApi {
       try {
         data = Json.from(jsonDecode(r.data ?? ''));
       } catch (_) {
+        AppLog.add('warn', 'GetAllENotice', 'پاسخ JSON نبود (احتمالاً نشست منقضی)', detail: _snip(r.data));
         throw SessionExpired();
       }
       final docs = (data['DocumentList'] as List?) ?? [];
@@ -514,7 +623,10 @@ class AdlApi {
     }, referer: _ret);
     _check(r);
     final j = jsonDecode(r.data ?? '');
-    if (j is! Map || j['NoticedDocId'] == null) throw Exception('ثبت مشاهده ناموفق');
+    if (j is! Map || j['NoticedDocId'] == null) {
+      AppLog.add('warn', 'SetENoticeToViewState', 'پاسخ بدون NoticedDocId', detail: _snip(r.data));
+      throw Exception('ثبت مشاهده ناموفق');
+    }
     return Json.from(j);
   }
 
@@ -527,13 +639,16 @@ class AdlApi {
     };
     const maxRetries = 8;
     var err1 = '';
+    String? lastBody;
     for (var i = 0; i <= maxRetries; i++) {
       final r = await _form('$_app/Notice/Home/DownloadENoticeAsPDF', form, _ret);
       if (r.statusCode == 302 || r.statusCode == 401) throw SessionExpired();
       if (_isPdf(r.data ?? [])) return r.data!;
       final t = _text(r);
       err1 = 'HTTP ${r.statusCode}';
+      lastBody = _snip(t);
       if ((t.contains('استخراج') || t.contains('دو دقیقه')) && i < maxRetries) {
+        AppLog.add('warn', 'DownloadENoticeAsPDF', 'سرور هنوز ابلاغیه را آماده نکرده (تلاش ${i + 1}/$maxRetries)', detail: lastBody);
         status('سرور در حال آماده‌سازی ابلاغیه است (${i + 1}/$maxRetries)...');
         await Future.delayed(const Duration(seconds: 30));
         continue;
@@ -544,6 +659,7 @@ class AdlApi {
     final r = await _postJson('$_app/Notice/Home/GetENoticeDocumentAsPDF', form, referer: _ret);
     final b = _tryB64(r.data ?? '');
     if (b != null) return b;
+    AppLog.add('error', 'DownloadENoticeAsPDF', 'دانلود ابلاغیه ${n['NoticedDocNo']} ناموفق ($err1)', detail: lastBody);
     throw Exception('دانلود ابلاغیه ناموفق ($err1)');
   }
 
@@ -578,6 +694,9 @@ class AdlApi {
         return (bytes: utf8.encode('${d['result']}'), ext: 'html');
       }
     } catch (_) {}
+    AppLog.add('error', 'DownloadAttachment',
+        'دانلود پیوست ناموفق — ابلاغیه $no',
+        detail: 'AttachmentType=${att['AttachmentType']}  ContentType=${att['ContentType']}  RowNum=${att['RowNum']}  عنوان=${att['AttachmentTitle']}');
     throw Exception('دانلود پیوست ناموفق');
   }
 
@@ -610,4 +729,103 @@ class AdlApi {
         }
         return Store.saveNotice(n, pdf, files);
       });
+
+  // ---------- صفحه‌ی فایل‌های ابلاغیه ----------
+  /// ثبت مشاهده و گرفتن فهرست پیوست‌ها
+  Future<Json> openNoticeMeta(Json n) => run(() async {
+        try {
+          return {...n, ...await _viewNotice(n)};
+        } on SessionExpired {
+          rethrow;
+        } catch (e, st) {
+          AppLog.error('ثبت مشاهده ابلاغیه ${n['NoticedDocNo']}', e, st: st);
+          return n; // با همان اطلاعات ادامه می‌دهیم
+        }
+      });
+
+  /// دانلود یک فایل: index = ‎-1‎ متن ابلاغیه، وگرنه شماره‌ی پیوست (از صفر)
+  Future<({List<int> bytes, String ext})> downloadPart(Json n, int index, void Function(String) status) =>
+      run(() async {
+        if (index < 0) return (bytes: await _downloadPdf(n, status), ext: 'pdf');
+        final atts = (n['AttachmentList'] as List?) ?? [];
+        final a = Json.from(atts[index] as Map);
+        return _downloadAttachment(a, '${n['NoticedDocNo']}');
+      });
+
+  // ---------- ابلاغیه‌های جدید (مشاهده‌نشده) ----------
+  /// سایت: «ابلاغیه‌های جدید» = GetNewENoticeWithoutNoticeText (بر اساس تاریخ ابلاغ).
+  /// اگر ابلاغیه‌ی جدیدی نباشد سرور HTTP 500 با پیام «شما ابلاغیه جدید ... ندارید» می‌دهد؛ این خطا نیست.
+  Future<({List<Json> items, String? emptyMessage})> fetchNew(DateTime start, DateTime end) => run(() async {
+        final all = <Json>[];
+        final seen = <dynamic>{};
+        String? msg;
+        final last = DateTime.utc(end.year, end.month, end.day);
+        var s = DateTime.utc(start.year, start.month, start.day);
+        while (!s.isAfter(last)) {
+          var e = s.add(const Duration(days: 89)); // سایت پیش‌فرض را ۳ ماه می‌گذارد
+          if (e.isAfter(last)) e = last;
+          final (items, m) = await _fetchNewWindow(jstr(s), jstr(e));
+          msg ??= m;
+          for (final n in items) {
+            if (seen.add(n['ObjectId'] ?? n['NoticedDocNo'])) all.add(n);
+          }
+          s = e.add(const Duration(days: 1));
+        }
+        all.sort((a, b) => '${b['WebDateTime'] ?? ''}'.compareTo('${a['WebDateTime'] ?? ''}'));
+        return (items: all, emptyMessage: all.isEmpty ? msg : null);
+      });
+
+  Future<(List<Json>, String?)> _fetchNewWindow(String from, String to) async {
+    const where = 'GetNewENoticeWithoutNoticeText';
+    final items = <Json>[];
+    var page = 1;
+    int? total;
+    while (true) {
+      final r = await _postJson(
+        '$_app/Notice/Home/$where',
+        {
+          'pageNumber': page,
+          'pageSize': '5',
+          'eNotifySearchCriteria': {'WebDateFrom': from, 'WebDateTo': to, 'LtrUnitTypeCode': '-'},
+        },
+        referer: _ret,
+        anyStatus: true,
+        quiet: true, // خطاها را خودمان با جزئیات ثبت می‌کنیم
+      );
+      final code = r.statusCode ?? 0;
+      if (code == 302 || code == 401 || code == 403) {
+        AppLog.add('warn', where, 'HTTP $code (احتمالاً نشست منقضی)', detail: _snip(r.data));
+        throw SessionExpired();
+      }
+      Json? j;
+      try {
+        final x = jsonDecode(r.data ?? '');
+        if (x is Map) j = Json.from(x);
+      } catch (_) {}
+      if (code != 200) {
+        final m = j?['result'];
+        if (code == 500 && m is String && m.contains('ابلاغیه جدید')) {
+          return (items, items.isEmpty ? m : null); // «ابلاغیه‌ی جدیدی ندارید»
+        }
+        AppLog.add('error', where, 'HTTP $code  بازه $from تا $to', detail: _snip(r.data));
+        throw Exception('خطای سرور (HTTP $code)${m is String ? ': $m' : ''}');
+      }
+      if (j == null) {
+        AppLog.add('warn', where, 'پاسخ JSON نبود (احتمالاً نشست منقضی)', detail: _snip(r.data));
+        throw SessionExpired();
+      }
+      var docs = j['DocumentList'] as List?;
+      docs ??= j.values.whereType<List>().firstOrNull;
+      if (docs == null) {
+        AppLog.add('warn', where, 'ساختار ناشناخته‌ی پاسخ؛ کلیدها: ${j.keys.join(', ')}', detail: _snip(r.data));
+        docs = [];
+      }
+      total ??= (j['TotalCount'] as num?)?.toInt();
+      items.addAll(docs.whereType<Map>().map((e) => Json.from(e)));
+      if (docs.isEmpty || (total != null && items.length >= total)) break;
+      page++;
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    return (items, null);
+  }
 }

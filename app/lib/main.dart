@@ -1,13 +1,30 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'dart:ui' show PlatformDispatcher;
+
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'adl_api.dart';
+import 'app_log.dart';
 import 'home.dart';
 import 'store.dart';
 
 final api = AdlApi();
 
-void main() => runApp(const App());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await AppLog.init();
+  // خطاهای پیش‌بینی‌نشده‌ی برنامه هم در لاگ ثبت شوند
+  FlutterError.onError = (d) {
+    AppLog.error('Flutter', d.exception, st: d.stack);
+    FlutterError.presentError(d);
+  };
+  PlatformDispatcher.instance.onError = (e, st) {
+    AppLog.error('خطای اجرا', e, st: st);
+    debugPrint('$e\n$st');
+    return true;
+  };
+  runApp(const App());
+}
 
 String errText(Object e) =>
     e is LoginRejected || e is SiteUnavailable || e is NeedSmsCode ? '$e' : 'خطا: $e';
@@ -112,11 +129,14 @@ class _LoginPageState extends State<LoginPage> {
   bool _busy = false;
   late bool _manual = Store.manual;
   String? _err;
+  bool _credErr = false; // کد ملی/رمز اشتباه
+  bool _showPw = false;
 
   @override
   void initState() {
     super.initState();
     _err = widget.error;
+    _credErr = (widget.error ?? '').startsWith('کد ملی یا رمز');
   }
 
   Future<void> _submit() async {
@@ -128,6 +148,7 @@ class _LoginPageState extends State<LoginPage> {
     setState(() {
       _busy = true;
       _err = null;
+      _credErr = false;
     });
     try {
       await api.signIn(nationalCode: nc, password: pw);
@@ -148,6 +169,14 @@ class _LoginPageState extends State<LoginPage> {
             ),
           ),
         );
+      }
+    } on WrongCredentials catch (e) {
+      if (mounted) {
+        setState(() {
+          _err = e.message;
+          _credErr = true;
+          _pw.clear();
+        });
       }
     } catch (e) {
       if (mounted) setState(() => _err = errText(e));
@@ -194,20 +223,55 @@ class _LoginPageState extends State<LoginPage> {
                     controller: _nc,
                     keyboardType: TextInputType.number,
                     maxLength: 10,
-                    decoration: const InputDecoration(labelText: 'نام کاربری (کد ملی)', border: OutlineInputBorder()),
+                    onChanged: (_) {
+                      if (_credErr) setState(() => _credErr = false);
+                    },
+                    decoration: InputDecoration(
+                      labelText: 'نام کاربری (کد ملی)',
+                      border: const OutlineInputBorder(),
+                      errorText: _credErr ? '' : null,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   TextField(
                     controller: _pw,
-                    obscureText: true,
+                    obscureText: !_showPw,
                     onSubmitted: (_) => _submit(),
-                    decoration: const InputDecoration(labelText: 'رمز عبور', border: OutlineInputBorder()),
+                    onChanged: (_) {
+                      if (_credErr) setState(() => _credErr = false);
+                    },
+                    decoration: InputDecoration(
+                      labelText: 'رمز عبور',
+                      border: const OutlineInputBorder(),
+                      errorText: _credErr ? '' : null,
+                      suffixIcon: IconButton(
+                        icon: Icon(_showPw ? Icons.visibility_off : Icons.visibility),
+                        onPressed: () => setState(() => _showPw = !_showPw),
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 16),
                   if (_err != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 12),
-                      child: Text(_err!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                    Container(
+                      width: double.infinity,
+                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.errorContainer,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Icon(_credErr ? Icons.lock_outline : Icons.error_outline,
+                            color: Theme.of(context).colorScheme.error),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(_err!,
+                              style: TextStyle(
+                                  color: Theme.of(context).colorScheme.onErrorContainer,
+                                  fontWeight: _credErr ? FontWeight.bold : FontWeight.normal,
+                                  fontSize: _credErr ? 17 : null)),
+                        ),
+                      ]),
                     ),
                   SizedBox(
                     width: double.infinity,

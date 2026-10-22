@@ -91,14 +91,41 @@ class Store {
     final r = await _root();
     savedKeys = {
       for (final e in r.listSync())
-        if (e is Directory && File('${e.path}/abelaghie.pdf').existsSync()) e.path.split(Platform.pathSeparator).last
+        if (e is Directory && File('${e.path}/info.json').existsSync()) e.path.split(Platform.pathSeparator).last
     };
   }
 
   static Future<Directory?> savedDir(Map n) async {
     if (kIsWeb) return null;
     final d = Directory('${(await _root()).path}/${key(n)}');
-    return File('${d.path}/abelaghie.pdf').existsSync() ? d : null;
+    return File('${d.path}/info.json').existsSync() ? d : null;
+  }
+
+  /// پوشه‌ی ابلاغیه (بدون ساخت)
+  static Future<Directory> dirFor(Map n) async => Directory('${(await _root()).path}/${key(n)}');
+
+  /// پوشه‌ی ابلاغیه (در صورت نبود ساخته می‌شود)
+  static Future<Directory> noticeDir(Map n) async {
+    final d = await dirFor(n);
+    if (!await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  static Future<Map<String, dynamic>> readInfo(Directory d) async {
+    try {
+      return Map<String, dynamic>.from(jsonDecode(await File('${d.path}/info.json').readAsString()));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// ذخیره‌ی اطلاعات ابلاغیه (با اولین فایل دانلودشده)؛ ابلاغیه در تب «ذخیره‌شده» می‌آید
+  static Future<void> writeInfo(Map n) async {
+    final d = await noticeDir(n);
+    await File('${d.path}/info.json')
+        .writeAsString(jsonEncode({...Map<String, dynamic>.from(n), 'savedAt': DateTime.now().toIso8601String()}));
+    savedKeys.add(key(n));
+    changes.value++;
   }
 
   static Future<Directory> saveNotice(Map n, List<int> pdf, Map<String, List<int>> files) async {
